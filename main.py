@@ -4,6 +4,7 @@ import threading
 import logging
 from flask import Flask, jsonify
 import pyotp
+import requests
 
 # ---- SmartAPI import fallback ----
 SmartConnect = None
@@ -17,10 +18,8 @@ except Exception:
     except Exception:
         SmartConnect = None
 
-from telegram import Bot
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-logger = logging.getLogger('angel-railway-bot')
+logger = logging.getLogger('angel-railway-bot-http')
 
 # Load config from env
 API_KEY = os.getenv('SMARTAPI_API_KEY')
@@ -35,12 +34,27 @@ REQUIRED = [API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET, TELE_TOKEN, TELE_CHAT_ID]
 
 app = Flask(__name__)
 
-def tele_send(bot: Bot, chat_id: str, text: str):
-    """Send Telegram message synchronously (works with python-telegram-bot v13.x)."""
+def tele_send_http(chat_id: str, text: str):
+    """Send message using Telegram Bot HTTP API via requests (synchronous)."""
     try:
-        bot.send_message(chat_id=chat_id, text=text)
+        token = TELE_TOKEN
+        if not token:
+            logger.error('TELEGRAM_BOT_TOKEN not set, cannot send Telegram message.')
+            return False
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML"
+        }
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code != 200:
+            logger.warning('Telegram API returned %s: %s', r.status_code, r.text)
+            return False
+        return True
     except Exception as e:
-        logger.exception('Telegram send failed: %s', e)
+        logger.exception('Failed to send Telegram message: %s', e)
+        return False
 
 def login_and_setup(api_key, client_id, password, totp_secret):
     if SmartConnect is None:
@@ -69,19 +83,22 @@ def find_symboltoken_for_query(smartApi, query):
     except TypeError:
         try:
             res = smartApi.searchScrip('NSE', query)
-        except Exception:
+        except Exception as e:
+            logger.exception('searchScrip fallback failed: %s', e)
             return None
-    except Exception:
+    except Exception as e:
+        logger.exception('searchScrip failed: %s', e)
         return None
     try:
-        candidates = res.get('data') if isinstance(res, dict) else res
-        if not candidates: 
+        candidates = res.get('data') if isinstance(res, dict) and 'data' in res else res
+        if not candidates:
             return None
         first = candidates[0]
         token = first.get('symboltoken') or first.get('token')
-        tsym = first.get('tradingsymbol') or first.get('symbol')
+        tsym = first.get('tradingsymbol') or first.get('symbol') or first.get('symbolName')
         return {'symboltoken': str(token), 'tradingsymbol': tsym}
     except Exception:
+        logger.exception('Parsing searchScrip response failed')
         return None
 
 def get_ltp(smartApi, exchange, tradingsymbol, symboltoken):
@@ -91,58 +108,76 @@ def get_ltp(smartApi, exchange, tradingsymbol, symboltoken):
             d = data.get('data') if isinstance(data.get('data'), dict) else data
             ltp = None
             if isinstance(d, dict):
-                ltp = d.get('ltp') or d.get('last_price')
-            return float(ltp) if ltp else None
+                ltp = d.get('ltp') or d.get('last_price') or d.get('ltpValue')
+            if ltp is None and isinstance(d, list) and len(d) > 0:
+                entry = d[0]
+                ltp = entry.get('ltp') or entry.get('last_price')
+            return float(ltp) if ltp is not None else None
+        else:
+            logger.warning('ltpData returned unexpected: %s', data)
+            return None
     except Exception:
-        pass
-    return None
+        logger.exception('ltpData call failed')
+        return None
 
 def bot_loop():
     if not all(REQUIRED):
-        logger.error('Missing env vars, bot will not start.')
+        logger.error('Missing required environment variables. Bot will not start.')
+        logger.error('Ensure SMARTAPI_API_KEY, SMARTAPI_CLIENT_ID, SMARTAPI_PASSWORD, SMARTAPI_TOTP_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID are set.')
         return
-    bot = Bot(token=TELE_TOKEN)
+
     try:
-        smartApi, *_ = login_and_setup(API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET)
+        smartApi, authToken, refreshToken, feedToken = login_and_setup(API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET)
     except Exception as e:
-        tele_send(bot, TELE_CHAT_ID, f'Login failed: {e}')
+        logger.exception('Login/setup failed: %s', e)
+        tele_send_http(TELE_CHAT_ID, f'Login failed: {e}')
         return
 
     targets = ['NIFTY 50', 'SENSEX']
     found = {}
     for t in targets:
         info = find_symboltoken_for_query(smartApi, t)
-        if info:
-            found[t] = info
+        if not info:
+            logger.warning('Could not find symbol for %s', t)
+            tele_send_http(TELE_CHAT_ID, f'Could not find symbol token for {t}.')
         else:
-            tele_send(bot, TELE_CHAT_ID, f'Could not find token for {t}')
+            found[t] = info
+            logger.info('Found %s -> %s', t, info)
 
     if not found:
-        tele_send(bot, TELE_CHAT_ID, 'No symbols found; bot stopped.')
+        logger.error('No symbols found. Exiting bot loop.')
+        tele_send_http(TELE_CHAT_ID, 'No symbols found; bot stopped.')
         return
 
-    tele_send(bot, TELE_CHAT_ID, f"Bot started. Polling every {POLL_INTERVAL}s for: {', '.join(found.keys())}")
+    tele_send_http(TELE_CHAT_ID, f"Bot started. Polling every {POLL_INTERVAL}s for: {', '.join(found.keys())}")
 
     while True:
+        messages = []
         ts = time.strftime('%Y-%m-%d %H:%M:%S')
-        msgs = []
         for name, info in found.items():
-            ltp = get_ltp(smartApi, 'NSE', info['tradingsymbol'], info['symboltoken'])
-            msgs.append(f"{ts} | {name}: {ltp if ltp else 'N/A'}")
-        tele_send(bot, TELE_CHAT_ID, "\n".join(msgs))
+            ltp = get_ltp(smartApi, 'NSE', info.get('tradingsymbol') or '', info.get('symboltoken') or '')
+            if ltp is None:
+                messages.append(f"{ts} | {name}: LTP not available")
+            else:
+                messages.append(f"{ts} | {name}: {ltp}")
+        text = "\n".join(messages)
+        logger.info('Sending message:\\n%s', text)
+        tele_send_http(TELE_CHAT_ID, text)
         time.sleep(POLL_INTERVAL)
 
-# Run bot loop in background
+# Start bot in a background thread at import time so Gunicorn/Procfile runs it.
 thread = threading.Thread(target=bot_loop, daemon=True)
 thread.start()
 
 @app.route('/')
 def index():
-    return jsonify({
+    status = {
         'bot_thread_alive': thread.is_alive(),
         'poll_interval': POLL_INTERVAL,
         'smartapi_sdk_available': SmartConnect is not None
-    })
+    }
+    return jsonify(status)
 
 if __name__ == '__main__':
+    # run locally for debugging
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 8080)))
