@@ -104,19 +104,35 @@ def setup_websocket(auth_token, api_key, client_id, feed_token):
     def on_data(wsapp, message):
         global latest_prices
         try:
-            # Parse websocket message
+            # Log raw message to debug
+            logger.info(f"WebSocket raw message: {message}")
+            
+            # Parse websocket message - handle binary data
+            if isinstance(message, bytes):
+                # Binary message - need to decode
+                import struct
+                # Angel WebSocket sends binary packed data
+                # Format varies, log first to understand structure
+                logger.info(f"Binary message length: {len(message)}, hex: {message[:50].hex()}")
+                return
+            
             if isinstance(message, dict):
                 token = str(message.get('token', ''))
-                ltp = message.get('last_traded_price') or message.get('ltp')
+                # Try different field names
+                ltp = (message.get('last_traded_price') or 
+                       message.get('ltp') or 
+                       message.get('last_price') or
+                       message.get('c'))
                 
-                if token == "99926000":  # NIFTY 50
-                    latest_prices['NIFTY 50'] = float(ltp) / 100 if ltp else None
-                elif token == "99926009":  # BANKNIFTY
-                    latest_prices['NIFTY BANK'] = float(ltp) / 100 if ltp else None
+                logger.info(f"Parsed: token={token}, ltp={ltp}, full={message}")
                 
-                logger.debug(f"Updated price: {token} = {ltp}")
+                if token == "99926000" and ltp:  # NIFTY 50
+                    latest_prices['NIFTY 50'] = float(ltp) / 100
+                elif token == "99926009" and ltp:  # BANKNIFTY
+                    latest_prices['NIFTY BANK'] = float(ltp) / 100
+                
         except Exception as e:
-            logger.error(f"Error parsing websocket data: {e}")
+            logger.exception(f"Error parsing websocket data: {e}")
     
     def on_open(wsapp):
         global ws_connected
