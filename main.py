@@ -5,20 +5,17 @@ import logging
 from flask import Flask, jsonify
 import pyotp
 import requests
+from bs4 import BeautifulSoup
 
 # ---- SmartAPI import (FIXED) ----
 SmartConnect = None
-SmartWebSocketV2 = None
 try:
     from SmartApi import SmartConnect as _SC
-    from SmartApi.smartWebSocketV2 import SmartWebSocketV2 as _WS
     SmartConnect = _SC
-    SmartWebSocketV2 = _WS
-    logging.info("SmartConnect and WebSocket imported successfully!")
+    logging.info("SmartConnect imported successfully!")
 except Exception as e:
     logging.error(f"Failed to import SmartConnect: {e}")
     SmartConnect = None
-    SmartWebSocketV2 = None
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger('angel-railway-bot-http')
@@ -35,10 +32,6 @@ POLL_INTERVAL = int(os.getenv('POLL_INTERVAL') or 60)
 REQUIRED = [API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET, TELE_TOKEN, TELE_CHAT_ID]
 
 app = Flask(__name__)
-
-# Global storage for latest prices
-latest_prices = {}
-ws_connected = False
 
 def tele_send_http(chat_id: str, text: str):
     """Send message using Telegram Bot HTTP API via requests (synchronous)."""
@@ -83,135 +76,123 @@ def login_and_setup(api_key, client_id, password, totp_secret):
         pass
     return smartApi, authToken, refreshToken, feedToken
 
-def setup_websocket(auth_token, api_key, client_id, feed_token):
-    """Setup WebSocket for real-time index data"""
-    global ws_connected, latest_prices
-    
-    if SmartWebSocketV2 is None:
-        logger.error("WebSocket not available")
-        return None
-    
-    # Index tokens for subscription
-    token_list = [
-        {
-            "exchangeType": 2,  # NSE indices
-            "tokens": ["99926000", "99926009"]  # NIFTY 50, BANKNIFTY
+def get_index_data_nseindia():
+    """Scrape NIFTY and BANKNIFTY from NSE India website"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json'
         }
-    ]
-    
-    sws = SmartWebSocketV2(auth_token, api_key, client_id, feed_token)
-    
-    def on_data(wsapp, message):
-        global latest_prices
-        try:
-            # Log raw message to debug
-            logger.info(f"WebSocket raw message: {message}")
+        
+        # NSE API endpoint for indices
+        url = "https://www.nseindia.com/api/allIndices"
+        
+        session = requests.Session()
+        # First request to get cookies
+        session.get("https://www.nseindia.com", headers=headers, timeout=10)
+        
+        # Get indices data
+        response = session.get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            result = {}
             
-            # Parse websocket message - handle binary data
-            if isinstance(message, bytes):
-                # Binary message - need to decode
-                import struct
-                # Angel WebSocket sends binary packed data
-                # Format varies, log first to understand structure
-                logger.info(f"Binary message length: {len(message)}, hex: {message[:50].hex()}")
-                return
+            for item in data.get('data', []):
+                index_name = item.get('index', '')
+                if 'NIFTY 50' in index_name or index_name == 'NIFTY 50':
+                    result['NIFTY 50'] = float(item.get('last', 0))
+                elif 'NIFTY BANK' in index_name or index_name == 'NIFTY BANK':
+                    result['NIFTY BANK'] = float(item.get('last', 0))
             
-            if isinstance(message, dict):
-                token = str(message.get('token', ''))
-                # Try different field names
-                ltp = (message.get('last_traded_price') or 
-                       message.get('ltp') or 
-                       message.get('last_price') or
-                       message.get('c'))
-                
-                logger.info(f"Parsed: token={token}, ltp={ltp}, full={message}")
-                
-                if token == "99926000" and ltp:  # NIFTY 50
-                    latest_prices['NIFTY 50'] = float(ltp) / 100
-                elif token == "99926009" and ltp:  # BANKNIFTY
-                    latest_prices['NIFTY BANK'] = float(ltp) / 100
-                
-        except Exception as e:
-            logger.exception(f"Error parsing websocket data: {e}")
-    
-    def on_open(wsapp):
-        global ws_connected
-        logger.info("WebSocket connected!")
-        ws_connected = True
-        sws.subscribe("correlation_id", 1, token_list)
-    
-    def on_error(wsapp, error):
-        global ws_connected
-        logger.error(f"WebSocket error: {error}")
-        ws_connected = False
-    
-    def on_close(wsapp):
-        global ws_connected
-        logger.info("WebSocket closed")
-        ws_connected = False
-    
-    sws.on_open = on_open
-    sws.on_data = on_data
-    sws.on_error = on_error
-    sws.on_close = on_close
-    
-    return sws
+            return result
+        else:
+            logger.warning(f"NSE API returned status {response.status_code}")
+            return None
+            
+    except Exception as e:
+        logger.exception(f"Failed to fetch NSE data: {e}")
+        return None
+
+def get_index_data_yahoo():
+    """Fallback: Get data from Yahoo Finance"""
+    try:
+        result = {}
+        
+        # NIFTY 50
+        url_nifty = "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI"
+        resp = requests.get(url_nifty, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            price = data['chart']['result'][0]['meta']['regularMarketPrice']
+            result['NIFTY 50'] = float(price)
+        
+        # NIFTY BANK
+        url_bank = "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEBANK"
+        resp = requests.get(url_bank, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            price = data['chart']['result'][0]['meta']['regularMarketPrice']
+            result['NIFTY BANK'] = float(price)
+        
+        return result if result else None
+        
+    except Exception as e:
+        logger.exception(f"Failed to fetch Yahoo data: {e}")
+        return None
 
 def bot_loop():
-    global ws_connected, latest_prices
-    
     if not all(REQUIRED):
         logger.error('Missing required environment variables. Bot will not start.')
         logger.error('Ensure SMARTAPI_API_KEY, SMARTAPI_CLIENT_ID, SMARTAPI_PASSWORD, SMARTAPI_TOTP_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID are set.')
         return
 
+    # Login to keep session active (even if not using for data)
     try:
         smartApi, authToken, refreshToken, feedToken = login_and_setup(API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET)
+        logger.info("Login successful - using public data sources for indices")
     except Exception as e:
         logger.exception('Login/setup failed: %s', e)
-        tele_send_http(TELE_CHAT_ID, f'Login failed: {e}')
-        return
+        tele_send_http(TELE_CHAT_ID, f'Login failed: {e}. Will try public data sources.')
 
-    # Setup WebSocket
-    logger.info("Setting up WebSocket for real-time data...")
-    sws = setup_websocket(authToken, API_KEY, CLIENT_ID, feedToken)
-    
-    if sws:
-        try:
-            # Start WebSocket in separate thread
-            ws_thread = threading.Thread(target=sws.connect, daemon=True)
-            ws_thread.start()
-            time.sleep(3)  # Wait for connection
-        except Exception as e:
-            logger.error(f"Failed to start WebSocket: {e}")
-            tele_send_http(TELE_CHAT_ID, f'WebSocket failed: {e}')
-            return
-    
-    if not ws_connected:
-        logger.error("WebSocket connection failed")
-        tele_send_http(TELE_CHAT_ID, 'WebSocket connection failed. Bot stopped.')
-        return
-
-    tele_send_http(TELE_CHAT_ID, f"Bot started with WebSocket! Polling every {POLL_INTERVAL}s for: NIFTY 50, NIFTY BANK")
+    tele_send_http(TELE_CHAT_ID, f"✅ Bot started! Polling every {POLL_INTERVAL}s for: NIFTY 50, NIFTY BANK\n\n📊 Using NSE India & Yahoo Finance for real-time data")
 
     while True:
-        messages = []
-        ts = time.strftime('%Y-%m-%d %H:%M:%S')
-        
-        for name in ['NIFTY 50', 'NIFTY BANK']:
-            ltp = latest_prices.get(name)
-            if ltp is None:
-                messages.append(f"{ts} | {name}: Waiting for data...")
+        try:
+            # Try NSE India first
+            prices = get_index_data_nseindia()
+            source = "NSE India"
+            
+            # Fallback to Yahoo Finance
+            if not prices:
+                logger.warning("NSE India failed, trying Yahoo Finance...")
+                prices = get_index_data_yahoo()
+                source = "Yahoo Finance"
+            
+            if prices:
+                messages = []
+                ts = time.strftime('%Y-%m-%d %H:%M:%S')
+                
+                for name in ['NIFTY 50', 'NIFTY BANK']:
+                    ltp = prices.get(name)
+                    if ltp:
+                        messages.append(f"📈 <b>{name}</b>: ₹{ltp:,.2f}")
+                    else:
+                        messages.append(f"📈 <b>{name}</b>: Data unavailable")
+                
+                messages.append(f"\n🕐 {ts}")
+                messages.append(f"📡 Source: {source}")
+                
+                text = "\n".join(messages)
+                logger.info('Sending update: %s', text)
+                tele_send_http(TELE_CHAT_ID, text)
             else:
-                messages.append(f"{ts} | {name}: {ltp:.2f}")
-        
-        # Add WebSocket status
-        ws_status = "✅ Connected" if ws_connected else "❌ Disconnected"
-        messages.append(f"WebSocket: {ws_status}")
-        
-        text = "\n".join(messages)
-        logger.info('Sending message:\n%s', text)
-        tele_send_http(TELE_CHAT_ID, text)
+                logger.error("All data sources failed!")
+                tele_send_http(TELE_CHAT_ID, "⚠️ Unable to fetch index data from any source")
+            
+        except Exception as e:
+            logger.exception(f"Error in bot loop: {e}")
+            tele_send_http(TELE_CHAT_ID, f"⚠️ Error: {e}")
         
         time.sleep(POLL_INTERVAL)
 
@@ -225,9 +206,7 @@ def index():
         'bot_thread_alive': thread.is_alive(),
         'poll_interval': POLL_INTERVAL,
         'smartapi_sdk_available': SmartConnect is not None,
-        'websocket_available': SmartWebSocketV2 is not None,
-        'websocket_connected': ws_connected,
-        'latest_prices': latest_prices
+        'data_source': 'NSE India / Yahoo Finance'
     }
     return jsonify(status)
 
