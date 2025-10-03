@@ -76,38 +76,46 @@ def login_and_setup(api_key, client_id, password, totp_secret):
     return smartApi, authToken, refreshToken, feedToken
 
 def get_market_data_angel(smartApi):
-    """Get live index data using Angel One Market Data API"""
+    """Get live index and stock data using Angel One Market Data API"""
     try:
-        # NIFTY 50 and BANKNIFTY tokens
+        # Define symbols with their tokens
+        # Token search: https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json
+        symbols = {
+            'NIFTY 50': '99926000',
+            'NIFTY BANK': '99926009',
+            'TCS': '11536',
+            'HDFCBANK': '1333',
+            'SBIN': '3045',
+            'RELIANCE': '2885'
+        }
+        
         result = {}
         
         # Method 1: Try getMarketData if available in SDK
         if hasattr(smartApi, 'getMarketData'):
             try:
-                # NIFTY 50 - token 99926000
-                nifty_data = smartApi.getMarketData('LTP', {'NSE': ['99926000']})
-                logger.info(f"NIFTY raw response: {nifty_data}")
+                # Batch request for all symbols
+                all_tokens = list(symbols.values())
+                data = smartApi.getMarketData('LTP', {'NSE': all_tokens})
+                logger.info(f"Batch API response: {data}")
                 
-                if nifty_data and nifty_data.get('status'):
-                    fetched = nifty_data.get('data', {}).get('fetched', [])
-                    if fetched and len(fetched) > 0:
-                        result['NIFTY 50'] = float(fetched[0].get('ltp', 0))
-                
-                # BANKNIFTY - token 99926009
-                bank_data = smartApi.getMarketData('LTP', {'NSE': ['99926009']})
-                logger.info(f"BANKNIFTY raw response: {bank_data}")
-                
-                if bank_data and bank_data.get('status'):
-                    fetched = bank_data.get('data', {}).get('fetched', [])
-                    if fetched and len(fetched) > 0:
-                        result['NIFTY BANK'] = float(fetched[0].get('ltp', 0))
+                if data and data.get('status'):
+                    fetched = data.get('data', {}).get('fetched', [])
+                    for item in fetched:
+                        token = item.get('symbolToken', '')
+                        ltp = item.get('ltp', 0)
+                        # Find symbol name by token
+                        for name, tok in symbols.items():
+                            if tok == token:
+                                result[name] = float(ltp) if ltp else 0
+                                break
                 
                 if result:
                     return result
             except Exception as e:
                 logger.warning(f"getMarketData method failed: {e}")
         
-        # Method 2: Direct API call
+        # Method 2: Direct API call (batch)
         headers = {
             'Authorization': f'Bearer {smartApi.access_token}',
             'Content-Type': 'application/json',
@@ -120,53 +128,35 @@ def get_market_data_angel(smartApi):
             'X-PrivateKey': API_KEY
         }
         
-        # Get NIFTY 50
-        payload_nifty = {
+        # Try batch request
+        payload = {
             "mode": "LTP",
             "exchangeTokens": {
-                "NSE": ["99926000"]
+                "NSE": list(symbols.values())
             }
         }
         
         response = requests.post(
             'https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote/',
-            json=payload_nifty,
+            json=payload,
             headers=headers,
             timeout=10
         )
         
-        logger.info(f"Direct API NIFTY response: {response.status_code} - {response.text}")
+        logger.info(f"Batch API response: {response.status_code}")
         
         if response.status_code == 200:
             data = response.json()
             if data.get('status'):
                 fetched = data.get('data', {}).get('fetched', [])
-                if fetched:
-                    result['NIFTY 50'] = float(fetched[0].get('ltp', 0))
-        
-        # Get BANKNIFTY
-        payload_bank = {
-            "mode": "LTP",
-            "exchangeTokens": {
-                "NSE": ["99926009"]
-            }
-        }
-        
-        response = requests.post(
-            'https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote/',
-            json=payload_bank,
-            headers=headers,
-            timeout=10
-        )
-        
-        logger.info(f"Direct API BANKNIFTY response: {response.status_code} - {response.text}")
-        
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('status'):
-                fetched = data.get('data', {}).get('fetched', [])
-                if fetched:
-                    result['NIFTY BANK'] = float(fetched[0].get('ltp', 0))
+                for item in fetched:
+                    token = item.get('symbolToken', '')
+                    ltp = item.get('ltp', 0)
+                    # Find symbol name by token
+                    for name, tok in symbols.items():
+                        if tok == token:
+                            result[name] = float(ltp) if ltp else 0
+                            break
         
         return result if result else None
         
@@ -198,15 +188,22 @@ def bot_loop():
                 messages = []
                 ts = time.strftime('%Y-%m-%d %H:%M:%S')
                 
+                # Indices first
+                messages.append("📊 <b>INDICES</b>")
                 for name in ['NIFTY 50', 'NIFTY BANK']:
                     ltp = prices.get(name, 0)
                     if ltp and ltp > 0:
-                        messages.append(f"📈 <b>{name}</b>: ₹{ltp:,.2f}")
-                    else:
-                        messages.append(f"📈 <b>{name}</b>: Data unavailable")
+                        messages.append(f"  • {name}: ₹{ltp:,.2f}")
+                
+                # Stocks
+                messages.append("\n📈 <b>STOCKS</b>")
+                for name in ['TCS', 'HDFCBANK', 'SBIN', 'RELIANCE']:
+                    ltp = prices.get(name, 0)
+                    if ltp and ltp > 0:
+                        messages.append(f"  • {name}: ₹{ltp:,.2f}")
                 
                 messages.append(f"\n🕐 {ts}")
-                messages.append(f"📡 Source: Angel One API")
+                messages.append(f"📡 Angel One API")
                 
                 text = "\n".join(messages)
                 logger.info('Sending update')
