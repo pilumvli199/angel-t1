@@ -2,15 +2,25 @@ import os
 import time
 import threading
 import logging
-from pathlib import Path
 from flask import Flask, jsonify
 import pyotp
-from SmartApi.smartConnect import SmartConnect
+
+# ---- SmartAPI import fallback ----
+SmartConnect = None
+try:
+    from SmartApi.smartConnect import SmartConnect as _SC
+    SmartConnect = _SC
+except Exception:
+    try:
+        from smartapi import SmartConnect as _SC2
+        SmartConnect = _SC2
+    except Exception:
+        SmartConnect = None
+
 from telegram import Bot
 
-# Basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-logger = logging.getLogger('angel-railway-bot')
+logger = logging.getLogger('angel-railway-bot-fixed')
 
 # Load config from env
 API_KEY = os.getenv('SMARTAPI_API_KEY')
@@ -32,6 +42,8 @@ def tele_send(bot: Bot, chat_id: str, text: str):
         logger.exception('Telegram send failed: %s', e)
 
 def login_and_setup(api_key, client_id, password, totp_secret):
+    if SmartConnect is None:
+        raise RuntimeError('SmartAPI SDK not available. Check requirements.txt installation.')
     smartApi = SmartConnect(api_key=api_key)
     totp = pyotp.TOTP(totp_secret).now()
     logger.info('Logging in to SmartAPI...')
@@ -40,42 +52,34 @@ def login_and_setup(api_key, client_id, password, totp_secret):
         raise RuntimeError(f"Login failed: {data}")
     authToken = data['data']['jwtToken']
     refreshToken = data['data']['refreshToken']
-    logger.info('Login successful, fetching feed token...')
     try:
         feedToken = smartApi.getfeedToken()
     except Exception:
         feedToken = None
-    # generateToken if needed
     try:
         smartApi.generateToken(refreshToken)
     except Exception:
-        logger.debug('generateToken not required or failed silently')
+        pass
     return smartApi, authToken, refreshToken, feedToken
 
 def find_symboltoken_for_query(smartApi, query):
-    logger.info(f"Searching symbol for: {query}")
     try:
         res = smartApi.searchScrip(query)
     except TypeError:
         try:
             res = smartApi.searchScrip('NSE', query)
-        except Exception as e:
-            logger.exception('searchScrip failed: %s', e)
+        except Exception:
             return None
-    except Exception as e:
-        logger.exception('searchScrip failed: %s', e)
-        return None
-
-    try:
-        candidates = res.get('data') if isinstance(res, dict) and 'data' in res else res
-        if not candidates:
-            return None
-        first = candidates[0]
-        token = first.get('symboltoken') or first.get('token') or first.get('symbolToken')
-        tradingsymbol = first.get('tradingsymbol') or first.get('tradingsymbol') or first.get('symbol')
-        return {'symboltoken': str(token), 'tradingsymbol': tradingsymbol}
     except Exception:
-        logger.exception('Parsing searchScrip response failed')
+        return None
+    try:
+        candidates = res.get('data') if isinstance(res, dict) else res
+        if not candidates: return None
+        first = candidates[0]
+        token = first.get('symboltoken') or first.get('token')
+        tsym = first.get('tradingsymbol') or first.get('symbol')
+        return {'symboltoken': str(token), 'tradingsymbol': tsym}
+    except Exception:
         return None
 
 def get_ltp(smartApi, exchange, tradingsymbol, symboltoken):
@@ -85,77 +89,51 @@ def get_ltp(smartApi, exchange, tradingsymbol, symboltoken):
             d = data.get('data') if isinstance(data.get('data'), dict) else data
             ltp = None
             if isinstance(d, dict):
-                ltp = d.get('ltp') or d.get('last_price') or d.get('ltpValue')
-            if ltp is None and isinstance(d, list) and len(d) > 0:
-                entry = d[0]
-                ltp = entry.get('ltp') or entry.get('last_price')
-            return float(ltp) if ltp is not None else None
-        else:
-            logger.warning('ltpData returned unexpected: %s', data)
-            return None
+                ltp = d.get('ltp') or d.get('last_price')
+            return float(ltp) if ltp else None
     except Exception:
-        logger.exception('ltpData call failed')
-        return None
+        pass
+    return None
 
 def bot_loop():
     if not all(REQUIRED):
-        logger.error('Missing required environment variables. Bot will not start.')
+        logger.error('Missing env vars, bot will not start.')
         return
-
     bot = Bot(token=TELE_TOKEN)
-
     try:
-        smartApi, authToken, refreshToken, feedToken = login_and_setup(API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET)
+        smartApi, *_ = login_and_setup(API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET)
     except Exception as e:
-        logger.exception('Login/setup failed: %s', e)
         tele_send(bot, TELE_CHAT_ID, f'Login failed: {e}')
         return
 
     targets = ['NIFTY 50', 'SENSEX']
-    found = {}
-    for t in targets:
-        info = find_symboltoken_for_query(smartApi, t)
-        if not info:
-            logger.warning('Could not find symbol for %s', t)
-            tele_send(bot, TELE_CHAT_ID, f'Could not find symbol token for {t}.')
-        else:
-            found[t] = info
+    found = {t: find_symboltoken_for_query(smartApi, t) for t in targets if find_symboltoken_for_query(smartApi, t)}
 
     if not found:
-        logger.error('No symbols found. Exiting bot loop.')
         tele_send(bot, TELE_CHAT_ID, 'No symbols found; bot stopped.')
         return
 
     tele_send(bot, TELE_CHAT_ID, f"Bot started. Polling every {POLL_INTERVAL}s for: {', '.join(found.keys())}")
 
     while True:
-        messages = []
         ts = time.strftime('%Y-%m-%d %H:%M:%S')
+        msgs = []
         for name, info in found.items():
-            ltp = get_ltp(smartApi, 'NSE', info.get('tradingsymbol') or '', info.get('symboltoken') or '')
-            if ltp is None:
-                messages.append(f"{ts} | {name}: LTP not available")
-            else:
-                messages.append(f"{ts} | {name}: {ltp}")
-        text = "\\n".join(messages)
-        logger.info('Sending message:\\n%s', text)
-        tele_send(bot, TELE_CHAT_ID, text)
+            ltp = get_ltp(smartApi, 'NSE', info['tradingsymbol'], info['symboltoken'])
+            msgs.append(f"{ts} | {name}: {ltp if ltp else 'N/A'}")
+        tele_send(bot, TELE_CHAT_ID, "\n".join(msgs))
         time.sleep(POLL_INTERVAL)
 
-# Start bot in a background thread at import time so Gunicorn/Procfile runs it.
 thread = threading.Thread(target=bot_loop, daemon=True)
 thread.start()
 
-# Minimal Flask app for healthcheck
 @app.route('/')
 def index():
-    status = {
+    return jsonify({
         'bot_thread_alive': thread.is_alive(),
-        'poll_interval': POLL_INTERVAL
-    }
-    return jsonify(status)
+        'poll_interval': POLL_INTERVAL,
+        'smartapi_sdk_available': SmartConnect is not None
+    })
 
-# Expose app for gunicorn: `gunicorn main:app`
 if __name__ == '__main__':
-    # allow running locally with `python main.py`
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 8080)))
