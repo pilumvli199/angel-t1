@@ -6,17 +6,15 @@ from flask import Flask, jsonify
 import pyotp
 import requests
 
-# ---- SmartAPI import fallback ----
+# ---- SmartAPI import (FIXED) ----
 SmartConnect = None
 try:
-    from SmartApi.smartConnect import SmartConnect as _SC
+    from SmartApi import SmartConnect as _SC
     SmartConnect = _SC
-except Exception:
-    try:
-        from smartapi import SmartConnect as _SC2
-        SmartConnect = _SC2
-    except Exception:
-        SmartConnect = None
+    logging.info("SmartConnect imported successfully!")
+except Exception as e:
+    logging.error(f"Failed to import SmartConnect: {e}")
+    SmartConnect = None
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger('angel-railway-bot-http')
@@ -161,7 +159,7 @@ def bot_loop():
             else:
                 messages.append(f"{ts} | {name}: {ltp}")
         text = "\n".join(messages)
-        logger.info('Sending message:\\n%s', text)
+        logger.info('Sending message:\n%s', text)
         tele_send_http(TELE_CHAT_ID, text)
         time.sleep(POLL_INTERVAL)
 
