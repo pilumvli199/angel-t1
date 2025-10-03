@@ -1,4 +1,4 @@
-git+https://github.com/angel-one/smartapi-python.git@main#egg=smartapi-python
+# requirements.txt (final)
 pyotp==2.8.0
 requests==2.31.0
 Flask==2.3.2
