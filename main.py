@@ -131,16 +131,17 @@ def bot_loop():
         tele_send_http(TELE_CHAT_ID, f'Login failed: {e}')
         return
 
-    targets = ['NIFTY 50', 'SENSEX']
+    # Indices need specific exchange and symbol format
+    targets = {
+        'NIFTY 50': {'exchange': 'NSE', 'tradingsymbol': 'Nifty 50', 'symboltoken': '99926000'},
+        'NIFTY BANK': {'exchange': 'NSE', 'tradingsymbol': 'Nifty Bank', 'symboltoken': '99926009'},
+        'SENSEX': {'exchange': 'BSE', 'tradingsymbol': 'SENSEX', 'symboltoken': '1'}
+    }
+    
     found = {}
-    for t in targets:
-        info = find_symboltoken_for_query(smartApi, t)
-        if not info:
-            logger.warning('Could not find symbol for %s', t)
-            tele_send_http(TELE_CHAT_ID, f'Could not find symbol token for {t}.')
-        else:
-            found[t] = info
-            logger.info('Found %s -> %s', t, info)
+    for name, info in targets.items():
+        found[name] = info
+        logger.info('Using predefined %s -> %s', name, info)
 
     if not found:
         logger.error('No symbols found. Exiting bot loop.')
@@ -153,7 +154,8 @@ def bot_loop():
         messages = []
         ts = time.strftime('%Y-%m-%d %H:%M:%S')
         for name, info in found.items():
-            ltp = get_ltp(smartApi, 'NSE', info.get('tradingsymbol') or '', info.get('symboltoken') or '')
+            exchange = info.get('exchange', 'NSE')
+            ltp = get_ltp(smartApi, exchange, info.get('tradingsymbol') or '', info.get('symboltoken') or '')
             if ltp is None:
                 messages.append(f"{ts} | {name}: LTP not available")
             else:
