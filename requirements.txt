@@ -3,3 +3,5 @@ requests==2.31.0
 Flask==2.3.2
 gunicorn==21.2.0
 smartapi-python
+logzero
+websocket-client
