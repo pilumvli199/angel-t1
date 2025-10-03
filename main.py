@@ -8,13 +8,17 @@ import requests
 
 # ---- SmartAPI import (FIXED) ----
 SmartConnect = None
+SmartWebSocketV2 = None
 try:
     from SmartApi import SmartConnect as _SC
+    from SmartApi.smartWebSocketV2 import SmartWebSocketV2 as _WS
     SmartConnect = _SC
-    logging.info("SmartConnect imported successfully!")
+    SmartWebSocketV2 = _WS
+    logging.info("SmartConnect and WebSocket imported successfully!")
 except Exception as e:
     logging.error(f"Failed to import SmartConnect: {e}")
     SmartConnect = None
+    SmartWebSocketV2 = None
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger('angel-railway-bot-http')
@@ -31,6 +35,10 @@ POLL_INTERVAL = int(os.getenv('POLL_INTERVAL') or 60)
 REQUIRED = [API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET, TELE_TOKEN, TELE_CHAT_ID]
 
 app = Flask(__name__)
+
+# Global storage for latest prices
+latest_prices = {}
+ws_connected = False
 
 def tele_send_http(chat_id: str, text: str):
     """Send message using Telegram Bot HTTP API via requests (synchronous)."""
@@ -75,50 +83,67 @@ def login_and_setup(api_key, client_id, password, totp_secret):
         pass
     return smartApi, authToken, refreshToken, feedToken
 
-def find_symboltoken_for_query(smartApi, query):
-    try:
-        res = smartApi.searchScrip(query)
-    except TypeError:
+def setup_websocket(auth_token, api_key, client_id, feed_token):
+    """Setup WebSocket for real-time index data"""
+    global ws_connected, latest_prices
+    
+    if SmartWebSocketV2 is None:
+        logger.error("WebSocket not available")
+        return None
+    
+    # Index tokens for subscription
+    token_list = [
+        {
+            "exchangeType": 2,  # NSE indices
+            "tokens": ["99926000", "99926009"]  # NIFTY 50, BANKNIFTY
+        }
+    ]
+    
+    sws = SmartWebSocketV2(auth_token, api_key, client_id, feed_token)
+    
+    def on_data(wsapp, message):
+        global latest_prices
         try:
-            res = smartApi.searchScrip('NSE', query)
+            # Parse websocket message
+            if isinstance(message, dict):
+                token = str(message.get('token', ''))
+                ltp = message.get('last_traded_price') or message.get('ltp')
+                
+                if token == "99926000":  # NIFTY 50
+                    latest_prices['NIFTY 50'] = float(ltp) / 100 if ltp else None
+                elif token == "99926009":  # BANKNIFTY
+                    latest_prices['NIFTY BANK'] = float(ltp) / 100 if ltp else None
+                
+                logger.debug(f"Updated price: {token} = {ltp}")
         except Exception as e:
-            logger.exception('searchScrip fallback failed: %s', e)
-            return None
-    except Exception as e:
-        logger.exception('searchScrip failed: %s', e)
-        return None
-    try:
-        candidates = res.get('data') if isinstance(res, dict) and 'data' in res else res
-        if not candidates:
-            return None
-        first = candidates[0]
-        token = first.get('symboltoken') or first.get('token')
-        tsym = first.get('tradingsymbol') or first.get('symbol') or first.get('symbolName')
-        return {'symboltoken': str(token), 'tradingsymbol': tsym}
-    except Exception:
-        logger.exception('Parsing searchScrip response failed')
-        return None
-
-def get_ltp(smartApi, exchange, tradingsymbol, symboltoken):
-    try:
-        data = smartApi.ltpData(exchange, tradingsymbol, symboltoken)
-        if isinstance(data, dict) and data.get('status') is not False:
-            d = data.get('data') if isinstance(data.get('data'), dict) else data
-            ltp = None
-            if isinstance(d, dict):
-                ltp = d.get('ltp') or d.get('last_price') or d.get('ltpValue')
-            if ltp is None and isinstance(d, list) and len(d) > 0:
-                entry = d[0]
-                ltp = entry.get('ltp') or entry.get('last_price')
-            return float(ltp) if ltp is not None else None
-        else:
-            logger.warning('ltpData returned unexpected: %s', data)
-            return None
-    except Exception:
-        logger.exception('ltpData call failed')
-        return None
+            logger.error(f"Error parsing websocket data: {e}")
+    
+    def on_open(wsapp):
+        global ws_connected
+        logger.info("WebSocket connected!")
+        ws_connected = True
+        sws.subscribe("correlation_id", 1, token_list)
+    
+    def on_error(wsapp, error):
+        global ws_connected
+        logger.error(f"WebSocket error: {error}")
+        ws_connected = False
+    
+    def on_close(wsapp):
+        global ws_connected
+        logger.info("WebSocket closed")
+        ws_connected = False
+    
+    sws.on_open = on_open
+    sws.on_data = on_data
+    sws.on_error = on_error
+    sws.on_close = on_close
+    
+    return sws
 
 def bot_loop():
+    global ws_connected, latest_prices
+    
     if not all(REQUIRED):
         logger.error('Missing required environment variables. Bot will not start.')
         logger.error('Ensure SMARTAPI_API_KEY, SMARTAPI_CLIENT_ID, SMARTAPI_PASSWORD, SMARTAPI_TOTP_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID are set.')
@@ -131,38 +156,47 @@ def bot_loop():
         tele_send_http(TELE_CHAT_ID, f'Login failed: {e}')
         return
 
-    # Indices need specific exchange and symbol format
-    targets = {
-        'NIFTY 50': {'exchange': 'NSE', 'tradingsymbol': 'Nifty 50', 'symboltoken': '99926000'},
-        'NIFTY BANK': {'exchange': 'NSE', 'tradingsymbol': 'Nifty Bank', 'symboltoken': '99926009'},
-        'SENSEX': {'exchange': 'BSE', 'tradingsymbol': 'SENSEX', 'symboltoken': '1'}
-    }
+    # Setup WebSocket
+    logger.info("Setting up WebSocket for real-time data...")
+    sws = setup_websocket(authToken, API_KEY, CLIENT_ID, feedToken)
     
-    found = {}
-    for name, info in targets.items():
-        found[name] = info
-        logger.info('Using predefined %s -> %s', name, info)
-
-    if not found:
-        logger.error('No symbols found. Exiting bot loop.')
-        tele_send_http(TELE_CHAT_ID, 'No symbols found; bot stopped.')
+    if sws:
+        try:
+            # Start WebSocket in separate thread
+            ws_thread = threading.Thread(target=sws.connect, daemon=True)
+            ws_thread.start()
+            time.sleep(3)  # Wait for connection
+        except Exception as e:
+            logger.error(f"Failed to start WebSocket: {e}")
+            tele_send_http(TELE_CHAT_ID, f'WebSocket failed: {e}')
+            return
+    
+    if not ws_connected:
+        logger.error("WebSocket connection failed")
+        tele_send_http(TELE_CHAT_ID, 'WebSocket connection failed. Bot stopped.')
         return
 
-    tele_send_http(TELE_CHAT_ID, f"Bot started. Polling every {POLL_INTERVAL}s for: {', '.join(found.keys())}")
+    tele_send_http(TELE_CHAT_ID, f"Bot started with WebSocket! Polling every {POLL_INTERVAL}s for: NIFTY 50, NIFTY BANK")
 
     while True:
         messages = []
         ts = time.strftime('%Y-%m-%d %H:%M:%S')
-        for name, info in found.items():
-            exchange = info.get('exchange', 'NSE')
-            ltp = get_ltp(smartApi, exchange, info.get('tradingsymbol') or '', info.get('symboltoken') or '')
+        
+        for name in ['NIFTY 50', 'NIFTY BANK']:
+            ltp = latest_prices.get(name)
             if ltp is None:
-                messages.append(f"{ts} | {name}: LTP not available")
+                messages.append(f"{ts} | {name}: Waiting for data...")
             else:
-                messages.append(f"{ts} | {name}: {ltp}")
+                messages.append(f"{ts} | {name}: {ltp:.2f}")
+        
+        # Add WebSocket status
+        ws_status = "✅ Connected" if ws_connected else "❌ Disconnected"
+        messages.append(f"WebSocket: {ws_status}")
+        
         text = "\n".join(messages)
         logger.info('Sending message:\n%s', text)
         tele_send_http(TELE_CHAT_ID, text)
+        
         time.sleep(POLL_INTERVAL)
 
 # Start bot in a background thread at import time so Gunicorn/Procfile runs it.
@@ -174,7 +208,10 @@ def index():
     status = {
         'bot_thread_alive': thread.is_alive(),
         'poll_interval': POLL_INTERVAL,
-        'smartapi_sdk_available': SmartConnect is not None
+        'smartapi_sdk_available': SmartConnect is not None,
+        'websocket_available': SmartWebSocketV2 is not None,
+        'websocket_connected': ws_connected,
+        'latest_prices': latest_prices
     }
     return jsonify(status)
 
