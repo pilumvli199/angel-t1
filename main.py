@@ -81,34 +81,65 @@ def get_index_data_nseindia():
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json'
+            'Accept': 'application/json',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br'
         }
-        
-        # NSE API endpoint for indices
-        url = "https://www.nseindia.com/api/allIndices"
         
         session = requests.Session()
         # First request to get cookies
         session.get("https://www.nseindia.com", headers=headers, timeout=10)
+        time.sleep(1)  # Wait for cookies
         
-        # Get indices data
-        response = session.get(url, headers=headers, timeout=10)
+        # Try multiple endpoints
+        result = {}
         
-        if response.status_code == 200:
-            data = response.json()
-            result = {}
-            
-            for item in data.get('data', []):
-                index_name = item.get('index', '')
-                if 'NIFTY 50' in index_name or index_name == 'NIFTY 50':
-                    result['NIFTY 50'] = float(item.get('last', 0))
-                elif 'NIFTY BANK' in index_name or index_name == 'NIFTY BANK':
-                    result['NIFTY BANK'] = float(item.get('last', 0))
-            
-            return result
-        else:
-            logger.warning(f"NSE API returned status {response.status_code}")
-            return None
+        # Method 1: Market data API (for live prices during market hours)
+        try:
+            url1 = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050"
+            response1 = session.get(url1, headers=headers, timeout=10)
+            if response1.status_code == 200:
+                data1 = response1.json()
+                # The main index info is usually first in the data array
+                for item in data1.get('data', []):
+                    if item.get('index') == 'NIFTY 50':
+                        result['NIFTY 50'] = float(item.get('last', 0))
+                        logger.info(f"NIFTY 50 from equity-stockIndices: {result['NIFTY 50']}")
+                        break
+        except Exception as e:
+            logger.warning(f"Method 1 failed: {e}")
+        
+        # Method 2: Try BANKNIFTY
+        try:
+            url2 = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20BANK"
+            response2 = session.get(url2, headers=headers, timeout=10)
+            if response2.status_code == 200:
+                data2 = response2.json()
+                for item in data2.get('data', []):
+                    if item.get('index') == 'NIFTY BANK':
+                        result['NIFTY BANK'] = float(item.get('last', 0))
+                        logger.info(f"NIFTY BANK from equity-stockIndices: {result['NIFTY BANK']}")
+                        break
+        except Exception as e:
+            logger.warning(f"Method 2 failed: {e}")
+        
+        # Method 3: Fallback to allIndices
+        if not result:
+            try:
+                url3 = "https://www.nseindia.com/api/allIndices"
+                response3 = session.get(url3, headers=headers, timeout=10)
+                if response3.status_code == 200:
+                    data3 = response3.json()
+                    for item in data3.get('data', []):
+                        index_name = item.get('index', '')
+                        if 'NIFTY 50' in index_name or index_name == 'NIFTY 50':
+                            result['NIFTY 50'] = float(item.get('last', 0))
+                        elif 'NIFTY BANK' in index_name or index_name == 'NIFTY BANK':
+                            result['NIFTY BANK'] = float(item.get('last', 0))
+            except Exception as e:
+                logger.warning(f"Method 3 failed: {e}")
+        
+        return result if result else None
             
     except Exception as e:
         logger.exception(f"Failed to fetch NSE data: {e}")
